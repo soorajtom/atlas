@@ -85,6 +85,27 @@ func (s *state) plan(changes []schema.Change) error {
 		}
 		planned = s.sortChanges(planned)
 	}
+
+	// Check if we have any table drops - if so, drop all materialized views first
+	// to avoid dependency issues with TimescaleDB continuous aggregates
+	hasTableDrops := false
+	for _, c := range planned {
+		if _, ok := c.(*schema.DropTable); ok {
+			hasTableDrops = true
+			break
+		}
+	}
+
+	if hasTableDrops {
+		// Add a single statement at the beginning to drop all materialized views from all schemas
+		// This prevents them from interfering with table drops
+		dropAllMatViewsSQL := s.buildDropAllMaterializedViewsSQL()
+		s.append(&migrate.Change{
+			Cmd:     dropAllMatViewsSQL,
+			Comment: "drop all materialized views and continuous aggregates from all schemas to avoid dependency conflicts",
+		})
+	}
+
 	for _, c := range planned {
 		switch c := c.(type) {
 		case *schema.AddTable:
@@ -330,6 +351,34 @@ func (s *state) dropTable(drop *schema.DropTable) error {
 	}
 	cmd.append(s)
 	return nil
+}
+
+// buildDropAllMaterializedViewsSQL generates SQL to drop ALL materialized views and TimescaleDB continuous aggregates
+// from all schemas. This is called once at the start of a migration plan if any tables are being dropped.
+// Based on the user's working script, adapted to handle all schemas.
+func (s *state) buildDropAllMaterializedViewsSQL() string {
+	// Drop all materialized views and TimescaleDB continuous aggregates from all schemas
+	// This matches the pattern from the user's working script, extended to all schemas
+	query := `DO $$
+DECLARE
+    schema_name TEXT;
+    view_name TEXT;
+BEGIN
+    FOR schema_name, view_name IN
+        SELECT n.nspname, c.relname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'v' 
+          AND c.relname IN (SELECT ca.view_name FROM timescaledb_information.continuous_aggregates ca)
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+        ORDER BY c.oid DESC
+    LOOP
+        EXECUTE format('DROP MATERIALIZED VIEW IF EXISTS %I.%I CASCADE', schema_name, view_name);
+        RAISE NOTICE 'Dropped materialized view: %', view_name;
+    END LOOP;
+END $$;`
+
+	return strings.TrimSpace(query)
 }
 
 // modifyTable builds the statements that bring the table into its modified state.
